@@ -1,0 +1,2014 @@
+---
+title: "Deterministic by design: simulations and analyses"
+author: "Luke C Evans and Becks Spake"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+---
+
+# Overview
+
+This document reproduces the simulation study and analyses accompanying *Deterministic by design: causal inference challenges for biodiversity change syntheses*.
+
+Four ecological scenarios are simulated:
+
+1. **Process effects:** `Z` directly affects annual richness dynamics.
+2. **Confounding:** an unobserved site characteristic affects both `Z` and initial richness, while `Z` also affects annual richness dynamics.
+3. **Compression:** `Z` affects initial richness, after which all communities experience the same annual process subject to a regional species-pool ceiling.
+4. **Detection bias:** `Z` affects species detection rather than true richness.
+
+The document compares two workflows:
+
+- a **conventional two-step workflow**, which estimates a temporal log-richness trend for each site and then relates those estimated trends to `Z`;
+- a **DAG-informed causal workflow**, which fits models appropriate to two predefined causal estimands and calculates those estimands from predictions under relatively low and high `Z`.
+
+The two causal estimands are:
+
+- the **total effect on 20-year richness change**, defined as the high-minus-low `Z` difference in annualised initial-to-final richness change;
+- the **contemporary annual-process effect**, defined as the high-minus-low `Z` difference in expected one-year net richness change among transitions beginning with the same preceding richness.
+
+Main outputs are the simulated datasets, conventional and DAG-informed model results, prediction-based causal contrasts, an explanatory figure comparing the workflows, and a light-touch comparison of fitted and generating annual-transition coefficients.
+
+# Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(patchwork)
+library(lme4)
+library(lmerTest)
+library(flextable)
+library(broom.mixed)
+library(broom)
+library(officer)
+library(mgcv)
+
+set.seed(1234)
+
+
+```
+
+# Global parameters
+
+```{r global-parameters}
+N_sites <- 200
+T_years <- 20
+z_sd <- 1
+sigma_proc <- 0.8
+
+site_df <- data.frame(
+  site = factor(seq_len(N_sites)),
+  Z = rnorm(N_sites, 0, z_sd)
+)
+
+time_df <- tibble(
+  year = 1:T_years
+)
+
+base_df <- tidyr::crossing(site_df, time_df)
+```
+
+# Simulate the four scenarios
+
+## Process effect
+
+`Z` does not affect initial richness but directly affects the subsequent proportional annual transition.
+
+```{r simulate-process}
+process_df <- base_df
+c0 <- 0.02
+cZ <- -0.025
+sigma_c <- 0.01
+
+site_pars_process <- process_df %>%
+  distinct(site, Z) %>%
+  mutate(Y_true = rpois(n(), 10))
+
+grow_vec_process <- c()
+
+for(i in seq_along(site_pars_process$Y_true)) {
+  y_out <- c()
+  log_lambda <- c()
+
+  y_out[1] <- site_pars_process$Y_true[i]
+  Z_here <- site_pars_process$Z[i]
+
+  for(j in 2:T_years) {
+    eps <- rnorm(1, 0, sigma_c)
+    log_lambda[j] <- log(y_out[j - 1] + 1e-6) + c0 + cZ * Z_here + eps
+    y_out[j] <- rpois(1, exp(log_lambda[j]))
+  }
+
+  grow_vec_process <- c(grow_vec_process, y_out)
+}
+
+process_df$Y_true <- grow_vec_process
+process_df$Y_obs <- rbinom(
+  n = length(process_df$Y_true),
+  size = process_df$Y_true,
+  prob = 1
+)
+
+process_cZ <- cZ
+```
+
+## Confounding
+
+An unobserved site characteristic `U` is associated with `Z` and determines initial richness. Initial richness affects later observations through the evolving richness state. Annual dynamics depend on current richness and `Z`.
+
+```{r simulate-confounding}
+confound_df <- base_df
+
+aU <- -0.5
+aZ <- 0
+bUZ <- 1
+sigma_U <- 0.25
+y0_intercept <- 10
+y0_sd <- 0.25
+c0 <- 0.02
+cZ <- -0.05
+sigma_c <- 0.05
+sigma_proc <- 0.05
+cYt <- -0.15
+
+site_pars_confound <- confound_df %>%
+  distinct(site, Z) %>%
+  mutate(
+    U = (Z - aZ) / bUZ + rnorm(n(), 0, sigma_U),
+    log_lambda_y0 = log(y0_intercept) + aU * U + rnorm(n(), 0, y0_sd),
+    Y_true = rpois(n(), lambda = exp(log_lambda_y0))
+  )
+
+lg_richness_reference <- mean(
+  log(site_pars_confound$Y_true + 1)
+)
+
+grow_vec_confound <- c()
+
+for(i in seq_len(nrow(site_pars_confound))) {
+  y_out <- c()
+  log_lambda <- c()
+
+  y_out[1] <- site_pars_confound$Y_true[i]
+  Z_here <- site_pars_confound$Z[i]
+
+  for(j in 2:T_years) {
+    lg_Yt_centred <-
+      log(y_out[j - 1] + 1) -
+      lg_richness_reference
+
+    C <-
+      c0 +
+      cZ * Z_here +
+      cYt * lg_Yt_centred +
+      rnorm(1, 0, sigma_c)
+
+    eps <- rnorm(1, 0, sigma_proc)
+
+    log_lambda[j] <-
+      log(y_out[j - 1] + 1) +
+      C +
+      eps
+
+    y_out[j] <- rpois(
+      1,
+      lambda = exp(log_lambda[j])
+    )
+  }
+
+  grow_vec_confound <- c(grow_vec_confound, y_out)
+}
+
+confound_df$Y_true <- grow_vec_confound
+confound_df$Y_obs <- rbinom(
+  n = length(confound_df$Y_true),
+  size = confound_df$Y_true,
+  prob = 1
+)
+
+confound_cZ <- cZ
+```
+
+## Compression
+
+`Z` affects initial richness but does not enter the annual transition process. Richness is bounded between zero and the regional species-pool ceiling `K`.
+
+```{r simulate-compression}
+compression_df <- base_df
+
+aZ <- 10
+y0_intercept <- 30
+y0_sd <- 1.5
+step_sd <- 1
+K <- 40
+global_growth <- 1.5
+
+site_pars_compression <- compression_df %>%
+  distinct(site, Z) %>%
+  mutate(
+    mu_y0 = y0_intercept + aZ * Z + rnorm(n(), 0, y0_sd),
+    mu_y0 = pmax(1e-6, pmin(K, mu_y0)),
+    log_lambda_y0 = log(mu_y0),
+    Y_true = rpois(n(), exp(log_lambda_y0)),
+    Y_true = pmax(1, pmin(K, Y_true))
+  )
+
+grow_vec_compression <- c()
+
+for(i in seq_along(site_pars_compression$Y_true)) {
+  y_out <- c()
+  y_out[1] <- site_pars_compression$Y_true[i]
+
+  for(j in 2:T_years) {
+    mu_j <- y_out[j - 1] + global_growth + rnorm(1, 0, step_sd)
+    mu_j <- pmax(1e-6, pmin(K, mu_j))
+    log_lambda_j <- log(mu_j)
+    y_out[j] <- rpois(1, exp(log_lambda_j))
+    y_out[j] <- pmax(0, pmin(K, y_out[j]))
+  }
+
+  grow_vec_compression <- c(grow_vec_compression, y_out)
+}
+
+compression_df$Y_true <- grow_vec_compression
+compression_df$Y_obs <- rbinom(
+  n = length(compression_df$Y_true),
+  size = compression_df$Y_true,
+  prob = 1
+)
+```
+
+## Detection bias
+
+`Z` does not affect true richness. Instead, `Z` affects species detection, and the association between `Z` and detection changes over time.
+
+```{r simulate-detection}
+detection_df <- base_df
+detection_df$Y_true <- rpois(nrow(base_df), 10)
+
+a0 <- 0.35
+alpha_g <- 0.3
+betaZ <- 1.2
+
+max_year <- max(detection_df$year)
+
+detection_df <- detection_df %>%
+  mutate(
+    weight = 1 - year / max_year,
+    p_it = plogis(
+      qlogis(a0) +
+        alpha_g * year +
+        betaZ * Z * weight
+    )
+  )
+
+detection_df$Y_obs <- rbinom(
+  nrow(detection_df),
+  size = pmax(1, round(detection_df$Y_true)),
+  prob = detection_df$p_it
+)
+```
+
+# Conventional two-step workflow
+
+The conventional workflow first estimates a temporal log-richness trend separately for each site, then relates those estimated trends to `Z`.
+
+```{r conventional-workflow}
+process_df$lg_Y_obs <- log(process_df$Y_obs + 1)
+confound_df$lg_Y_obs <- log(confound_df$Y_obs + 1)
+compression_df$lg_Y_obs <- log(compression_df$Y_obs + 1)
+detection_df$lg_Y_obs <- log(detection_df$Y_obs + 1)
+
+run_site_slopes <- function(df) {
+  coefs <- c()
+  Zs <- c()
+
+  for(i in unique(df$site)) {
+    t_site <- dplyr::filter(df, site == i)
+    t_mod <- lm(lg_Y_obs ~ year, data = t_site)
+    coefs <- c(coefs, coef(t_mod)["year"])
+    Zs <- c(Zs, t_site$Z[1])
+  }
+
+  cbind.data.frame(
+    site = unique(df$site),
+    coef = coefs,
+    Z = Zs
+  )
+}
+
+trends_process <- run_site_slopes(process_df)
+trends_confound <- run_site_slopes(confound_df)
+trends_compression <- run_site_slopes(compression_df)
+trends_detection <- run_site_slopes(detection_df)
+
+process_model <- lm(coef ~ Z, data = trends_process)
+confound_model <- lm(coef ~ Z, data = trends_confound)
+compression_model <- lm(coef ~ Z, data = trends_compression)
+detection_model <- lm(coef ~ Z, data = trends_detection)
+```
+
+# DAG-informed causal workflow
+
+## Prepare the longitudinal data
+
+```{r prepare-causal-data}
+prepare_causal_data <- function(data) {
+  data %>%
+    arrange(site, year) %>%
+    group_by(site) %>%
+    mutate(
+      lagY = lag(Y_obs),
+      lg_lag_Y = log(lagY + 1),
+      lg_Y_obs = log(Y_obs + 1),
+      y0 = first(Y_obs),
+      lg_y0 = log(y0 + 1),
+      year0 = year - 1 # Set the first monitoring observation as time 0.
+    ) %>%
+    ungroup()
+}
+
+process_df <- prepare_causal_data(process_df)
+confound_df <- prepare_causal_data(confound_df)
+compression_df <- prepare_causal_data(compression_df)
+detection_df <- prepare_causal_data(detection_df)
+```
+
+## Process-effect models
+
+```{r process-models}
+direct_process <- lm(
+  lg_Y_obs ~ Z + lg_lag_Y,
+  data = process_df
+)
+
+total_process <- lmer(
+  lg_Y_obs ~
+    year0 * Z +
+    (1 + year0 | site),
+  data = process_df,
+  control = lmerControl(optimizer = "bobyqa")
+)
+```
+
+## Confounding models
+
+The contemporary model conditions on preceding richness. The total-trajectory model adjusts for initial richness and allows initial richness to be associated with the subsequent trajectory.
+
+```{r confounding-models}
+direct_confound <- lm(
+  lg_Y_obs ~ Z + lg_lag_Y,
+  data = confound_df %>%
+    filter(!is.na(lagY))
+)
+
+total_confound <- lmer(
+  lg_Y_obs ~
+    year0 * Z +
+    year0 * lg_y0 +
+    (1 + year0 | site),
+  data = confound_df %>%
+    filter(year0 > 0),
+  control = lmerControl(optimizer = "bobyqa")
+)
+```
+
+## Compression models
+
+The contemporary model represents nonlinear dependence on preceding richness using a natural spline. The total model uses a spline for time to represent flattening as communities approach the richness ceiling.
+
+```{r compression-models}
+direct_compression <- gam(
+  lg_Y_obs ~
+    Z +
+    s(lagY, k = 5),
+  data = compression_df %>%
+    filter(!is.na(lagY))
+)
+
+total_compression <- gam(
+  lg_Y_obs ~
+    s(year0, k = 5) + Z +
+    Z:year0 +
+    s(site, bs = "re"),
+  data = compression_df
+)
+```
+
+## Detection bias
+
+The effects of `Z` on true richness are not identifiable from observed richness alone in the Detection-bias scenario. No DAG-informed causal outcome model is fitted.
+
+# Exposure contrast and overlap
+
+Identification requires adequate overlap between the exposure values being compared at relevant values of the variables used for adjustment or standardisation. We therefore conducted two descriptive overlap checks. For the contemporary annual-process effect, we assessed whether the low and high values of Z were represented across groups of preceding richness in the Process-effect, Confounding and Compression scenarios. For the Confounding total effect, which adjusted for initial richness, we checked whether both exposure values were represented across groups of initial richness. These checks indicate whether the prediction contrasts are supported by observed combinations of Z and richness or depend on extrapolation.
+
+
+```{r overlap-check}
+# =========================================================
+# Exposure contrast and overlap
+# =========================================================
+#
+# The causal estimands compare relatively low and high values
+# of Z, defined as the 25th and 75th percentiles of the common
+# site-level Z distribution.
+#
+# Identification requires both exposure values to be supported
+# at relevant values of variables held constant or adjusted for.
+#
+# We conduct two descriptive overlap checks:
+#
+# 1. Contemporary annual-process effect
+#    This estimand compares high and low Z at the same preceding
+#    richness, Yt. We assess whether both exposure values are
+#    represented across preceding-richness groups in the
+#    Process-effect, Confounding and Compression scenarios.
+#
+# 2. Confounding total effect
+#    This estimand adjusts for initial richness, Y0. We therefore
+#    assess whether both exposure values are represented across
+#    initial-richness groups in the Confounding scenario.
+#
+# Richness is grouped into quintiles to avoid treating sparsely
+# represented exact count values as separate overlap strata.
+# These are descriptive checks of data support rather than
+# formal statistical tests of positivity.
+
+
+# ---------------------------------------------------------
+# Define the exposure contrast
+# ---------------------------------------------------------
+
+z_low <- as.numeric(
+  stats::quantile(
+    site_df$Z,
+    probs = 0.25,
+    na.rm = TRUE
+  )
+)
+
+z_high <- as.numeric(
+  stats::quantile(
+    site_df$Z,
+    probs = 0.75,
+    na.rm = TRUE
+  )
+)
+
+exposure_contrast <- tibble::tibble(
+  Exposure = c(
+    "Low Z",
+    "High Z"
+  ),
+  Value = c(
+    z_low,
+    z_high
+  )
+)
+
+exposure_contrast
+
+
+# ---------------------------------------------------------
+# Helper function:
+# overlap across preceding richness
+# ---------------------------------------------------------
+
+check_lagY_overlap <- function(
+    data,
+    scenario,
+    n_groups = 5
+) {
+
+  data %>%
+    dplyr::filter(
+      !is.na(lagY)
+    ) %>%
+    dplyr::mutate(
+      richness_group = dplyr::ntile(
+        lagY,
+        n_groups
+      )
+    ) %>%
+    dplyr::group_by(
+      richness_group
+    ) %>%
+    dplyr::summarise(
+      Scenario = scenario,
+
+      n_transitions = dplyr::n(),
+
+      richness_min = min(
+        lagY,
+        na.rm = TRUE
+      ),
+
+      richness_max = max(
+        lagY,
+        na.rm = TRUE
+      ),
+
+      Z_min = min(
+        Z,
+        na.rm = TRUE
+      ),
+
+      Z_max = max(
+        Z,
+        na.rm = TRUE
+      ),
+
+      supports_low_Z =
+        Z_min <= z_low &
+        Z_max >= z_low,
+
+      supports_high_Z =
+        Z_min <= z_high &
+        Z_max >= z_high,
+
+      supports_contrast =
+        supports_low_Z &
+        supports_high_Z,
+
+      .groups = "drop"
+    )
+}
+
+
+# ---------------------------------------------------------
+# Contemporary annual-process effect:
+# overlap across preceding richness
+# ---------------------------------------------------------
+
+lagY_overlap_by_group <- dplyr::bind_rows(
+
+  check_lagY_overlap(
+    process_df,
+    "Process effect"
+  ),
+
+  check_lagY_overlap(
+    confound_df,
+    "Confounding"
+  ),
+
+  check_lagY_overlap(
+    compression_df,
+    "Compression"
+  )
+
+) %>%
+  dplyr::mutate(
+    Scenario = factor(
+      Scenario,
+      levels = c(
+        "Process effect",
+        "Confounding",
+        "Compression"
+      )
+    )
+  )
+
+
+lagY_overlap_summary <- lagY_overlap_by_group %>%
+  dplyr::group_by(
+    Scenario
+  ) %>%
+  dplyr::summarise(
+    richness_groups = dplyr::n(),
+
+    groups_supporting_contrast = sum(
+      supports_contrast
+    ),
+
+    transitions_in_supported_groups = sum(
+      n_transitions[supports_contrast]
+    ),
+
+    total_transitions = sum(
+      n_transitions
+    ),
+
+    proportion_transitions_supported =
+      transitions_in_supported_groups /
+      total_transitions,
+
+    .groups = "drop"
+  )
+
+
+lagY_overlap_by_group
+lagY_overlap_summary
+
+
+# ---------------------------------------------------------
+# Confounding total effect:
+# overlap across initial richness
+# ---------------------------------------------------------
+
+y0_overlap_by_group <- confound_df %>%
+  dplyr::distinct(
+    site,
+    Z,
+    y0
+  ) %>%
+  dplyr::mutate(
+    richness_group = dplyr::ntile(
+      y0,
+      5
+    )
+  ) %>%
+  dplyr::group_by(
+    richness_group
+  ) %>%
+  dplyr::summarise(
+    Scenario = "Confounding",
+
+    n_sites = dplyr::n(),
+
+    richness_min = min(
+      y0,
+      na.rm = TRUE
+    ),
+
+    richness_max = max(
+      y0,
+      na.rm = TRUE
+    ),
+
+    Z_min = min(
+      Z,
+      na.rm = TRUE
+    ),
+
+    Z_max = max(
+      Z,
+      na.rm = TRUE
+    ),
+
+    supports_low_Z =
+      Z_min <= z_low &
+      Z_max >= z_low,
+
+    supports_high_Z =
+      Z_min <= z_high &
+      Z_max >= z_high,
+
+    supports_contrast =
+      supports_low_Z &
+      supports_high_Z,
+
+    .groups = "drop"
+  )
+
+
+y0_overlap_summary <- y0_overlap_by_group %>%
+  dplyr::summarise(
+    richness_groups = dplyr::n(),
+
+    groups_supporting_contrast = sum(
+      supports_contrast
+    ),
+
+    sites_in_supported_groups = sum(
+      n_sites[supports_contrast]
+    ),
+
+    total_sites = sum(
+      n_sites
+    ),
+
+    proportion_sites_supported =
+      sites_in_supported_groups /
+      total_sites
+  )
+
+
+y0_overlap_by_group
+y0_overlap_summary
+
+
+# ---------------------------------------------------------
+# Common colours and theme
+# ---------------------------------------------------------
+
+overlap_colours <- c(
+  `TRUE` = "black",
+  `FALSE` = "#D55E00"
+)
+
+overlap_labels <- c(
+  `TRUE` = "Supports contrast",
+  `FALSE` = "Limited overlap"
+)
+
+overlap_theme <- ggplot2::theme_classic(
+  base_size = 11
+) +
+  ggplot2::theme(
+    legend.position = "bottom",
+
+    plot.title = ggplot2::element_text(
+      face = "bold",
+      size = 12
+    ),
+
+    plot.subtitle = ggplot2::element_text(
+      size = 10
+    ),
+
+    plot.margin = ggplot2::margin(
+      t = 6,
+      r = 8,
+      b = 6,
+      l = 6
+    )
+  )
+
+
+# ---------------------------------------------------------
+# Plot 1:
+# preceding-richness overlap for contemporary effect
+# ---------------------------------------------------------
+
+lagY_overlap_plot <- ggplot2::ggplot(
+  lagY_overlap_by_group,
+  ggplot2::aes(
+    x = Z_min,
+    xend = Z_max,
+    y = factor(richness_group),
+    yend = factor(richness_group),
+    colour = supports_contrast
+  )
+) +
+  ggplot2::geom_segment(
+    linewidth = 1.3
+  ) +
+  ggplot2::geom_point(
+    ggplot2::aes(
+      x = Z_min,
+      y = factor(richness_group)
+    ),
+    size = 2
+  ) +
+  ggplot2::geom_point(
+    ggplot2::aes(
+      x = Z_max,
+      y = factor(richness_group)
+    ),
+    size = 2
+  ) +
+  ggplot2::geom_vline(
+    xintercept = z_low,
+    linetype = 2,
+    colour = "#0072B2",
+    linewidth = 0.7
+  ) +
+  ggplot2::geom_vline(
+    xintercept = z_high,
+    linetype = 2,
+    colour = "#009E73",
+    linewidth = 0.7
+  ) +
+  ggplot2::facet_wrap(
+    ~ Scenario,
+    ncol = 1
+  ) +
+  ggplot2::scale_colour_manual(
+    values = overlap_colours,
+    labels = overlap_labels
+  ) +
+  ggplot2::labs(
+    title =
+      "a) Contemporary annual-process effect",
+
+    subtitle =
+      "Z ranges within preceding-richness quintiles",
+
+    x =
+      "Observed Z range",
+
+    y =
+      "Preceding-richness quintile",
+
+    colour = NULL
+  ) +
+  overlap_theme
+
+
+# ---------------------------------------------------------
+# Plot 2:
+# initial-richness overlap for Confounding total effect
+# ---------------------------------------------------------
+
+y0_overlap_plot <- ggplot2::ggplot(
+  y0_overlap_by_group,
+  ggplot2::aes(
+    x = Z_min,
+    xend = Z_max,
+    y = factor(richness_group),
+    yend = factor(richness_group),
+    colour = supports_contrast
+  )
+) +
+  ggplot2::geom_segment(
+    linewidth = 1.3
+  ) +
+  ggplot2::geom_point(
+    ggplot2::aes(
+      x = Z_min,
+      y = factor(richness_group)
+    ),
+    size = 2
+  ) +
+  ggplot2::geom_point(
+    ggplot2::aes(
+      x = Z_max,
+      y = factor(richness_group)
+    ),
+    size = 2
+  ) +
+  ggplot2::geom_vline(
+    xintercept = z_low,
+    linetype = 2,
+    colour = "#0072B2",
+    linewidth = 0.7
+  ) +
+  ggplot2::geom_vline(
+    xintercept = z_high,
+    linetype = 2,
+    colour = "#009E73",
+    linewidth = 0.7
+  ) +
+  ggplot2::scale_colour_manual(
+    values = overlap_colours,
+    labels = overlap_labels
+  ) +
+  ggplot2::labs(
+    title =
+      "b) Confounding total effect",
+
+    subtitle =
+      "Z ranges within initial-richness quintiles",
+
+    x =
+      "Observed Z range",
+
+    y =
+      "Initial-richness quintile",
+
+    colour = NULL
+  ) +
+  overlap_theme +
+  ggplot2::theme(
+    legend.position = "none"
+  )
+
+
+# ---------------------------------------------------------
+# Display figures side by side
+# ---------------------------------------------------------
+
+overlap_figure <-
+  lagY_overlap_plot +
+  y0_overlap_plot +
+  patchwork::plot_layout(
+    ncol = 2,
+    widths = c(
+      1.65,
+      1
+    )
+  )
+
+
+overlap_figure
+
+
+# ---------------------------------------------------------
+# Save the combined figure
+# ---------------------------------------------------------
+
+ggplot2::ggsave(
+  filename =
+    "figures/exposure_overlap_checks.png",
+
+  plot =
+    overlap_figure,
+
+  width = 13.5,
+  height = 7,
+  dpi = 300,
+  bg = "white"
+)
+
+
+# ---------------------------------------------------------
+# Save overlap summaries
+# ---------------------------------------------------------
+
+readr::write_csv(
+  lagY_overlap_by_group,
+  "Tables/lagged_richness_overlap_by_group.csv"
+)
+
+readr::write_csv(
+  lagY_overlap_summary,
+  "Tables/lagged_richness_overlap_summary.csv"
+)
+
+readr::write_csv(
+  y0_overlap_by_group,
+  "Tables/initial_richness_overlap_by_group.csv"
+)
+
+readr::write_csv(
+  y0_overlap_summary,
+  "Tables/initial_richness_overlap_summary.csv"
+)
+```
+
+
+
+
+
+# Prediction of the target estimands
+
+The models are used to produce the counterfactual predictions required for each causal question
+
+#
+# The fitted-model coefficients are not themselves the target
+# estimands. The models are used to generate the counterfactual
+# predictions required for each causal question.
+#
+# Total effect on 20-year richness change:
+#
+# 1. Predict initial and final richness under relatively low Z.
+# 2. Predict initial and final richness under relatively high Z.
+# 3. Calculate annualised initial-to-final richness change under
+#    each exposure value.
+# 4. Calculate the high-minus-low contrast and average across sites.
+#
+# In the Process and Confounding scenarios, Z does not causally affect
+# initial richness, so each site's observed initial richness is retained
+# under both exposure values. In the Compression scenario, Z affects
+# initial richness, so both initial and final richness are predicted
+# under each exposure value.
+#
+# Contemporary annual-process effect:
+#
+# 1. Retain the observed preceding richness for each annual transition.
+# 2. Predict next-year richness under relatively low Z.
+# 3. Predict next-year richness under relatively high Z.
+# 4. Calculate the high-minus-low difference in expected one-year
+#    net richness change and average across annual transitions.
+#
+# Predictions are transformed back to the richness scale so that both
+# estimands are reported as additive differences in species per site
+# per year.
+#
+# This follows a prediction-based approach in which fitted models are
+# queried for scientifically interpretable quantities rather than
+# interpreting individual regression coefficients directly:
+# https://journals.sagepub.com/doi/10.1177/25152459261424825.
+
+For the total effect, annualised initial-to-final richness change is calculated under low and high `Z`, then contrasted and averaged across sites. In Process and Confounding, initial richness is retained under both exposure values. In Compression, initial and final richness are both predicted under each exposure value.
+
+For the contemporary effect, preceding richness is retained for each observed transition, next-year richness is predicted under low and high `Z`, and the high-minus-low difference in expected one-year net richness change is averaged across transitions.
+
+```{r prediction-helpers}
+predict_richness <- function(model, newdata) {
+  if (inherits(model, "merMod")) {
+    predicted_log_richness <- predict(
+      model,
+      newdata = newdata,
+      re.form = NA,
+      allow.new.levels = TRUE
+    )
+  } else {
+    predicted_log_richness <- predict(
+      model,
+      newdata = newdata
+    )
+  }
+
+  smearing_factor <- mean(
+    exp(residuals(model)),
+    na.rm = TRUE
+  )
+
+  pmax(
+    0,
+    exp(predicted_log_richness) * smearing_factor - 1
+  )
+}
+
+estimate_total_no_baseline_effect <- function(model, data, z_low, z_high) {
+  site_data <- data %>%
+    dplyr::arrange(site, year) %>%
+    dplyr::group_by(site) %>%
+    dplyr::summarise(
+      Y_initial = dplyr::first(Y_obs),
+      y0 = dplyr::first(Y_obs),
+      lg_y0 = log(y0 + 1),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      year = T_years,
+      year0 = T_years - 1
+    )
+
+  low_data <- site_data %>% dplyr::mutate(Z = z_low)
+  high_data <- site_data %>% dplyr::mutate(Z = z_high)
+
+  predicted_final_low <- predict_richness(model, low_data)
+  predicted_final_high <- predict_richness(model, high_data)
+
+  effects <- site_data %>%
+    dplyr::transmute(
+      site,
+      annualised_low =
+        (predicted_final_low - Y_initial) / (T_years - 1),
+      annualised_high =
+        (predicted_final_high - Y_initial) / (T_years - 1),
+      estimate = annualised_high - annualised_low
+    )
+
+  summary <- effects %>%
+    dplyr::summarise(
+      low_Z = mean(annualised_low, na.rm = TRUE),
+      high_Z = mean(annualised_high, na.rm = TRUE),
+      estimate = mean(estimate, na.rm = TRUE)
+    )
+
+  list(summary = summary, effects = effects)
+}
+
+estimate_total_compression <- function(model, data, z_low, z_high) {
+  site_data <- data %>% dplyr::distinct(site)
+
+  low_initial <- site_data %>%
+    dplyr::mutate(Z = z_low, year = 1, year0 = 0)
+  low_final <- site_data %>%
+    dplyr::mutate(Z = z_low, year = T_years, year0 = T_years - 1)
+  high_initial <- site_data %>%
+    dplyr::mutate(Z = z_high, year = 1, year0 = 0)
+  high_final <- site_data %>%
+    dplyr::mutate(Z = z_high, year = T_years, year0 = T_years - 1)
+
+  predicted_initial_low <- predict_richness(model, low_initial)
+  predicted_final_low <- predict_richness(model, low_final)
+  predicted_initial_high <- predict_richness(model, high_initial)
+  predicted_final_high <- predict_richness(model, high_final)
+
+  effects <- site_data %>%
+    dplyr::transmute(
+      site,
+      annualised_low =
+        (predicted_final_low - predicted_initial_low) / (T_years - 1),
+      annualised_high =
+        (predicted_final_high - predicted_initial_high) / (T_years - 1),
+      estimate = annualised_high - annualised_low
+    )
+
+  summary <- effects %>%
+    dplyr::summarise(
+      low_Z = mean(annualised_low, na.rm = TRUE),
+      high_Z = mean(annualised_high, na.rm = TRUE),
+      estimate = mean(estimate, na.rm = TRUE)
+    )
+
+  list(summary = summary, effects = effects)
+}
+
+estimate_direct_effect <- function(model, data, z_low, z_high) {
+  transition_data <- data %>%
+    dplyr::filter(!is.na(lagY))
+
+  low_data <- transition_data %>% dplyr::mutate(Z = z_low)
+  high_data <- transition_data %>% dplyr::mutate(Z = z_high)
+
+  predicted_low <- predict_richness(model, low_data)
+  predicted_high <- predict_richness(model, high_data)
+
+  effects <- transition_data %>%
+    dplyr::transmute(
+      site,
+      year,
+      lagY,
+      change_low = predicted_low - lagY,
+      change_high = predicted_high - lagY,
+      estimate = predicted_high - predicted_low
+    )
+
+  summary <- effects %>%
+    dplyr::summarise(
+      low_Z = mean(change_low, na.rm = TRUE),
+      high_Z = mean(change_high, na.rm = TRUE),
+      estimate = mean(estimate, na.rm = TRUE)
+    )
+
+  list(summary = summary, effects = effects)
+}
+```
+
+```{r calculate-estimands}
+process_total_estimate <- estimate_total_no_baseline_effect(
+  total_process, process_df, z_low, z_high
+)
+confound_total_estimate <- estimate_total_no_baseline_effect(
+  total_confound, confound_df, z_low, z_high
+)
+compression_total_estimate <- estimate_total_compression(
+  total_compression, compression_df, z_low, z_high
+)
+
+process_direct_estimate <- estimate_direct_effect(
+  direct_process, process_df, z_low, z_high
+)
+confound_direct_estimate <- estimate_direct_effect(
+  direct_confound, confound_df, z_low, z_high
+)
+compression_direct_estimate <- estimate_direct_effect(
+  direct_compression, compression_df, z_low, z_high
+)
+
+causal_estimates <- dplyr::bind_rows(
+  process_total_estimate$summary %>%
+    dplyr::mutate(Scenario = "Process", Estimand = "Total"),
+  confound_total_estimate$summary %>%
+    dplyr::mutate(Scenario = "Confounding", Estimand = "Total"),
+  compression_total_estimate$summary %>%
+    dplyr::mutate(Scenario = "Compression", Estimand = "Total"),
+  process_direct_estimate$summary %>%
+    dplyr::mutate(Scenario = "Process", Estimand = "Contemporary"),
+  confound_direct_estimate$summary %>%
+    dplyr::mutate(Scenario = "Confounding", Estimand = "Contemporary"),
+  compression_direct_estimate$summary %>%
+    dplyr::mutate(Scenario = "Compression", Estimand = "Contemporary")
+) %>%
+  dplyr::select(Scenario, Estimand, low_Z, high_Z, estimate)
+
+causal_estimates
+```
+
+# Explanatory figure
+
+The explanatory figure combines simulated trajectories, predictions for the two causal estimands, and the conventional trend–`Z` association. Under Detection bias, effects on true richness are not identifiable from observed richness alone.
+
+```{r explanatory-figure, fig.width=13, fig.height=12}
+# =========================================================
+# Explanatory figure
+# =========================================================
+#
+# Each scenario occupies the same column across all four rows.
+# Row headings and y-axis titles are added as separate panels so that
+# long labels do not alter panel widths or overlap adjacent rows.
+
+
+# ---------------------------------------------------------
+# Scenario order
+# ---------------------------------------------------------
+
+scenario_levels <- c(
+  "Process",
+  "Confounding",
+  "Compression",
+  "Detection bias"
+)
+
+
+# ---------------------------------------------------------
+# Prepare trajectory data
+# ---------------------------------------------------------
+
+trajectory_data <- dplyr::bind_rows(
+
+  process_df %>%
+    dplyr::mutate(
+      Scenario = "Process"
+    ),
+
+  confound_df %>%
+    dplyr::mutate(
+      Scenario = "Confounding"
+    ),
+
+  compression_df %>%
+    dplyr::mutate(
+      Scenario = "Compression"
+    ),
+
+  detection_df %>%
+    dplyr::mutate(
+      Scenario = "Detection bias"
+    )
+
+) %>%
+  dplyr::mutate(
+    Scenario = factor(
+      Scenario,
+      levels = scenario_levels
+    )
+  )
+
+
+# ---------------------------------------------------------
+# Prepare causal-prediction data
+# ---------------------------------------------------------
+
+causal_plot_data <- causal_estimates %>%
+  dplyr::select(
+    Scenario,
+    Estimand,
+    low_Z,
+    high_Z
+  ) %>%
+  tidyr::pivot_longer(
+    cols = c(
+      low_Z,
+      high_Z
+    ),
+    names_to = "Z_level",
+    values_to = "value"
+  ) %>%
+  dplyr::mutate(
+    Z_level = dplyr::recode(
+      Z_level,
+      low_Z = "Low Z",
+      high_Z = "High Z"
+    ),
+
+    Z_level = factor(
+      Z_level,
+      levels = c(
+        "Low Z",
+        "High Z"
+      )
+    ),
+
+    Scenario = factor(
+      Scenario,
+      levels = scenario_levels
+    )
+  )
+
+
+# ---------------------------------------------------------
+# Prepare conventional-workflow data
+# ---------------------------------------------------------
+
+conventional_plot_data <- dplyr::bind_rows(
+
+  trends_process %>%
+    dplyr::mutate(
+      Scenario = "Process"
+    ),
+
+  trends_confound %>%
+    dplyr::mutate(
+      Scenario = "Confounding"
+    ),
+
+  trends_compression %>%
+    dplyr::mutate(
+      Scenario = "Compression"
+    ),
+
+  trends_detection %>%
+    dplyr::mutate(
+      Scenario = "Detection bias"
+    )
+
+) %>%
+  dplyr::mutate(
+    Scenario = factor(
+      Scenario,
+      levels = scenario_levels
+    )
+  )
+
+
+# Use the same Z-axis limits in every conventional-workflow panel.
+
+common_Z_limits <- range(
+  site_df$Z,
+  na.rm = TRUE
+)
+
+
+# ---------------------------------------------------------
+# Common panel theme
+# ---------------------------------------------------------
+
+panel_theme <- ggplot2::theme_classic(
+  base_size = 10
+) +
+  ggplot2::theme(
+    plot.margin = ggplot2::margin(
+      t = 7,
+      r = 7,
+      b = 7,
+      l = 7
+    ),
+
+    plot.title = ggplot2::element_text(
+      size = 10,
+      face = "plain",
+      hjust = 0.5,
+      margin = ggplot2::margin(
+        b = 4
+      )
+    ),
+
+    axis.title.x = ggplot2::element_text(
+      size = 10,
+      margin = ggplot2::margin(
+        t = 5
+      )
+    ),
+
+    axis.title.y = ggplot2::element_blank(),
+
+    axis.text = ggplot2::element_text(
+      size = 9
+    )
+  )
+
+
+# ---------------------------------------------------------
+# Helper: full-width row heading
+# ---------------------------------------------------------
+
+make_row_heading <- function(label) {
+
+  ggplot2::ggplot() +
+    ggplot2::annotate(
+      "text",
+      x = 0,
+      y = 0.5,
+      label = label,
+      hjust = 0,
+      vjust = 0.5,
+      fontface = "bold",
+      size = 5
+    ) +
+    ggplot2::xlim(
+      0,
+      1
+    ) +
+    ggplot2::ylim(
+      0,
+      1
+    ) +
+    ggplot2::theme_void() +
+    ggplot2::theme(
+      plot.margin = ggplot2::margin(
+        t = 2,
+        r = 4,
+        b = 2,
+        l = 4
+      )
+    )
+}
+
+
+heading_a <- make_row_heading(
+  "a) Simulated observations"
+)
+
+heading_b <- make_row_heading(
+  "b) Total effect"
+)
+
+heading_c <- make_row_heading(
+  "c) Direct effect"
+)
+
+heading_d <- make_row_heading(
+  "d) Conventional trend-Z relationship"
+)
+
+
+# ---------------------------------------------------------
+# Helper: separate y-axis title
+# ---------------------------------------------------------
+#
+# Giving the y-axis title its own narrow column prevents long titles
+# from changing the widths of the scenario panels or overlapping the
+# rows above and below.
+
+make_y_title <- function(label) {
+
+  ggplot2::ggplot() +
+    ggplot2::annotate(
+      "text",
+      x = 0.5,
+      y = 0.5,
+      label = label,
+      angle = 90,
+      hjust = 0.5,
+      vjust = 0.5,
+      size = 3.6
+    ) +
+    ggplot2::xlim(
+      0,
+      1
+    ) +
+    ggplot2::ylim(
+      0,
+      1
+    ) +
+    ggplot2::theme_void() +
+    ggplot2::theme(
+      plot.margin = ggplot2::margin(
+        t = 3,
+        r = 0,
+        b = 3,
+        l = 0
+      )
+    )
+}
+
+
+y_title_a <- make_y_title(
+  "Observed richness"
+)
+
+y_title_b <- make_y_title(
+  "Annualised richness change"
+)
+
+y_title_c <- make_y_title(
+  "Expected one-year richness change"
+)
+
+y_title_d <- make_y_title(
+  "Annual log-richness trend"
+)
+
+
+# ---------------------------------------------------------
+# Row a: simulated observations
+# ---------------------------------------------------------
+
+make_trajectory_panel <- function(
+    current_scenario,
+    show_title = TRUE
+) {
+
+  ggplot2::ggplot(
+    trajectory_data %>%
+      dplyr::filter(
+        Scenario == current_scenario
+      ),
+    ggplot2::aes(
+      x = year,
+      y = Y_obs,
+      group = site,
+      colour = Z
+    )
+  ) +
+    ggplot2::geom_line(
+      alpha = 0.25,
+      linewidth = 0.3
+    ) +
+    ggplot2::scale_colour_viridis_c(
+      limits = common_Z_limits
+    ) +
+    ggplot2::labs(
+      x = NULL,
+      y = NULL,
+
+      title = if(show_title) {
+        current_scenario
+      } else {
+        NULL
+      },
+
+      colour = "Z"
+    ) +
+    panel_theme
+}
+
+
+a1 <- make_trajectory_panel(
+  "Process"
+)
+
+a2 <- make_trajectory_panel(
+  "Confounding"
+)
+
+a3 <- make_trajectory_panel(
+  "Compression"
+)
+
+a4 <- make_trajectory_panel(
+  "Detection bias"
+)
+
+
+# ---------------------------------------------------------
+# Rows b and c: total and direct effects
+# ---------------------------------------------------------
+
+make_causal_panel <- function(
+    current_scenario,
+    current_estimand,
+    colour
+) {
+
+  if(current_scenario == "Detection bias") {
+
+    return(
+      ggplot2::ggplot(
+        data.frame(
+          Z_level = factor(
+            c(
+              "Low Z",
+              "High Z"
+            ),
+            levels = c(
+              "Low Z",
+              "High Z"
+            )
+          ),
+
+          value = c(
+            0,
+            0
+          )
+        ),
+        ggplot2::aes(
+          x = Z_level,
+          y = value
+        )
+      ) +
+        ggplot2::annotate(
+          "text",
+          x = 1.5,
+          y = 0,
+          label =
+            "Not identifiable\nfrom observed\nrichness alone",
+          size = 3.5
+        ) +
+        ggplot2::labs(
+          x = NULL,
+          y = NULL
+        ) +
+        ggplot2::theme_void() +
+        ggplot2::theme(
+          plot.margin = ggplot2::margin(
+            t = 7,
+            r = 7,
+            b = 7,
+            l = 7
+          )
+        )
+    )
+  }
+
+
+  ggplot2::ggplot(
+    causal_plot_data %>%
+      dplyr::filter(
+        Scenario == current_scenario,
+        Estimand == current_estimand
+      ),
+    ggplot2::aes(
+      x = Z_level,
+      y = value,
+      group = 1
+    )
+  ) +
+    ggplot2::geom_hline(
+      yintercept = 0,
+      linetype = 2,
+      colour = "grey75"
+    ) +
+    ggplot2::geom_line(
+      colour = colour,
+      linewidth = 0.8
+    ) +
+    ggplot2::geom_point(
+      colour = colour,
+      size = 2.8
+    ) +
+    ggplot2::labs(
+      x = NULL,
+      y = NULL
+    ) +
+    panel_theme
+}
+
+
+# Total effect
+
+b1 <- make_causal_panel(
+  "Process",
+  "Total",
+  colour = "#0072B2"
+)
+
+b2 <- make_causal_panel(
+  "Confounding",
+  "Total",
+  colour = "#0072B2"
+)
+
+b3 <- make_causal_panel(
+  "Compression",
+  "Total",
+  colour = "#0072B2"
+)
+
+b4 <- make_causal_panel(
+  "Detection bias",
+  "Total",
+  colour = "#0072B2"
+)
+
+
+# Direct effect
+
+c1 <- make_causal_panel(
+  "Process",
+  "Contemporary",
+  colour = "#009E73"
+)
+
+c2 <- make_causal_panel(
+  "Confounding",
+  "Contemporary",
+  colour = "#009E73"
+)
+
+c3 <- make_causal_panel(
+  "Compression",
+  "Contemporary",
+  colour = "#009E73"
+)
+
+c4 <- make_causal_panel(
+  "Detection bias",
+  "Contemporary",
+  colour = "#009E73"
+)
+
+
+# ---------------------------------------------------------
+# Row d: conventional trend-Z relationship
+# ---------------------------------------------------------
+
+make_conventional_panel <- function(
+    current_scenario
+) {
+
+  ggplot2::ggplot(
+    conventional_plot_data %>%
+      dplyr::filter(
+        Scenario == current_scenario
+      ),
+    ggplot2::aes(
+      x = Z,
+      y = coef
+    )
+  ) +
+    ggplot2::geom_hline(
+      yintercept = 0,
+      linetype = 2,
+      colour = "grey75"
+    ) +
+    ggplot2::geom_point(
+      alpha = 0.45,
+      size = 1.1
+    ) +
+    ggplot2::geom_smooth(
+      method = "lm",
+      formula = y ~ x,
+      se = TRUE,
+      colour = "#D55E00",
+      fill = "#F4A582",
+      alpha = 0.25,
+      linewidth = 0.8
+    ) +
+    ggplot2::scale_x_continuous(
+      limits = common_Z_limits
+    ) +
+    ggplot2::labs(
+      x = "Z",
+      y = NULL
+    ) +
+    panel_theme
+}
+
+
+d1 <- make_conventional_panel(
+  "Process"
+)
+
+d2 <- make_conventional_panel(
+  "Confounding"
+)
+
+d3 <- make_conventional_panel(
+  "Compression"
+)
+
+d4 <- make_conventional_panel(
+  "Detection bias"
+)
+
+
+# ---------------------------------------------------------
+# Assemble the complete figure
+# ---------------------------------------------------------
+#
+# The first column contains only the y-axis titles.
+# The other four columns contain the four scenarios.
+#
+# Every scenario therefore occupies exactly the same horizontal
+# position in all four rows.
+
+
+figure_design <- "
+AAAAA
+BCDEF
+GGGGG
+HIJKL
+MMMMM
+NOPQR
+SSSSS
+TUVWX
+"
+
+
+explanatory_figure <-
+  heading_a +
+  y_title_a + a1 + a2 + a3 + a4 +
+
+  heading_b +
+  y_title_b + b1 + b2 + b3 + b4 +
+
+  heading_c +
+  y_title_c + c1 + c2 + c3 + c4 +
+
+  heading_d +
+  y_title_d + d1 + d2 + d3 + d4 +
+
+  patchwork::plot_layout(
+    design = figure_design,
+
+    widths = c(
+      0.12,
+      1,
+      1,
+      1,
+      1
+    ),
+
+    heights = c(
+      0.10,  # heading a
+      1.25,  # simulated observations
+      0.10,  # heading b
+      0.95,  # total effect
+      0.10,  # heading c
+      0.95,  # direct effect
+      0.10,  # heading d
+      1.00   # conventional analysis
+    ),
+
+    guides = "collect"
+  ) &
+  ggplot2::theme(
+    legend.position = "bottom"
+  )
+
+
+explanatory_figure
+
+
+ggplot2::ggsave(
+  filename =
+    "figures/explanatory_figure_aligned.png",
+
+  plot =
+    explanatory_figure,
+
+  width = 13.5,
+  height = 14,
+  dpi = 300,
+  bg = "white"
+)
+
+```
+
+# Annual-transition coefficient comparison - how well does the causal approach do? Is it 'right'?
+
+This final check compares the generating log-scale `Z` coefficients with coefficients from the DAG-informed annual-transition models. The conventional two-step coefficients are shown for context but represent a different statistical quantity. The comparison is based on one simulated dataset and is not an assessment of repeated-simulation bias or coverage.
+
+```{r coefficient-comparison}
+extract_z <- function(mod) {
+  broom::tidy(mod,parametric = TRUE) %>%
+    dplyr::filter(term == "Z") %>%
+    dplyr::summarise(
+      cell = sprintf("%.3f (%.3f)", estimate, std.error)
+    ) %>%
+    dplyr::pull(cell)
+}
+
+coefficient_table <- tibble::tibble(
+  Scenario = c(
+    "Process effect",
+    "Confounding",
+    "Compression",
+    "Detection bias"
+  ),
+
+  `Generating log-scale Z coefficient` = c(
+    "-0.025",
+    "-0.050",
+    "0",
+    "0"
+  ),
+
+  `Causal-workflow fitted Z coefficient` = c(
+    extract_z(direct_process),
+    extract_z(direct_confound),
+    extract_z(direct_compression),
+    "Not identifiable"
+  ),
+
+  `Conventional-workflow coefficient` = c(
+    extract_z(process_model),
+    extract_z(confound_model),
+    extract_z(compression_model),
+    extract_z(detection_model)
+  )
+)
+
+coefficient_ft <- flextable::flextable(coefficient_table) %>%
+  flextable::autofit()
+
+coefficient_ft
+
+doc <- officer::read_docx()
+
+doc <- flextable::body_add_flextable(
+  x = doc,
+  value = coefficient_ft
+)
+
+print(
+  doc,
+  target = "Tables/coefficient_comparison.docx"
+)
+```
+
+```{r coefficient-figure, fig.width=8, fig.height=4.5}
+coef_plot_df <- dplyr::bind_rows(
+  tibble::tibble(
+    Scenario = "Process",
+    Method = "Conventional workflow",
+    estimate = coef(process_model)[["Z"]]
+  ),
+  tibble::tibble(
+    Scenario = "Process",
+    Method = "Causal workflow",
+    estimate = coef(direct_process)[["Z"]]
+  ),
+  tibble::tibble(
+    Scenario = "Process",
+    Method = "Generating coefficient",
+    estimate = -0.025
+  ),
+
+  tibble::tibble(
+    Scenario = "Confounding",
+    Method = "Conventional workflow",
+    estimate = coef(confound_model)[["Z"]]
+  ),
+  tibble::tibble(
+    Scenario = "Confounding",
+    Method = "Causal workflow",
+    estimate = coef(direct_confound)[["Z"]]
+  ),
+  tibble::tibble(
+    Scenario = "Confounding",
+    Method = "Generating coefficient",
+    estimate = -0.050
+  ),
+
+  tibble::tibble(
+    Scenario = "Compression",
+    Method = "Conventional workflow",
+    estimate = coef(compression_model)[["Z"]]
+  ),
+  tibble::tibble(
+    Scenario = "Compression",
+    Method = "Causal workflow",
+    estimate = coef(direct_compression)[["Z"]]
+  ),
+  tibble::tibble(
+    Scenario = "Compression",
+    Method = "Generating coefficient",
+    estimate = 0
+  ),
+
+  tibble::tibble(
+    Scenario = "Detection bias",
+    Method = "Conventional workflow",
+    estimate = coef(detection_model)[["Z"]]
+  ),
+  tibble::tibble(
+    Scenario = "Detection bias",
+    Method = "Generating coefficient",
+    estimate = 0
+  )
+)
+
+coef_plot_df$Method <- factor(
+  coef_plot_df$Method,
+  levels = c(
+    "Conventional workflow",
+    "Causal workflow",
+    "Generating coefficient"
+  )
+)
+
+coef_plot_df$Scenario <- factor(
+  coef_plot_df$Scenario,
+  levels = rev(
+    c(
+      "Process",
+      "Confounding",
+      "Compression",
+      "Detection bias"
+    )
+  )
+)
+
+coefficient_recovery_plot <- ggplot2::ggplot(
+  coef_plot_df,
+  ggplot2::aes(
+    x = estimate,
+    y = Scenario,
+    colour = Method,
+    shape = Method
+  )
+) +
+  ggplot2::geom_vline(
+    xintercept = 0,
+    colour = "grey70",
+    linetype = 2,
+    linewidth = 0.5
+  ) +
+  ggplot2::geom_point(
+    size = 3.5
+  ) +
+  ggplot2::scale_colour_manual(
+    values = c(
+      "Conventional workflow" = "#D55E00",
+      "Causal workflow" = "#0072B2",
+      "Generating coefficient" = "black"
+    )
+  ) +
+  ggplot2::scale_shape_manual(
+    values = c(
+      "Conventional workflow" = 16,
+      "Causal workflow" = 16,
+      "Generating coefficient" = 18
+    )
+  ) +
+  ggplot2::labs(
+    x = "Log-scale Z coefficient",
+    y = NULL,
+    colour = NULL,
+    shape = NULL
+  ) +
+  ggplot2::theme_classic(base_size = 12) +
+  ggplot2::theme(
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    axis.title.y = ggplot2::element_blank(),
+    axis.text.y = ggplot2::element_text(size = 11),
+    axis.text.x = ggplot2::element_text(size = 11),
+    legend.text = ggplot2::element_text(size = 11)
+  )
+
+coefficient_recovery_plot
+
+ggplot2::ggsave(
+  filename = "figures/coefficient_recovery_plot.png",
+  plot = coefficient_recovery_plot,
+  width = 8,
+  height = 4.5,
+  dpi = 300,
+  bg = "white"
+)
+```
+
+
+

@@ -1,0 +1,4 @@
+Scenario,richness_groups,groups_supporting_contrast,transitions_in_supported_groups,total_transitions,proportion_transitions_supported
+Process effect,5,5,3800,3800,1
+Confounding,5,5,3800,3800,1
+Compression,5,5,3800,3800,1
